@@ -479,20 +479,129 @@ class TestMobilerakerCompanionIntegration(unittest.TestCase):
 
     async def test_evaluate_threshold_check(self):
         """Test that _evaluate respects threshold checks before processing."""
-        # Set up a previous snapshot
         self.companion._last_snapshot = self._create_test_snapshot(print_state="printing", progress=50)
-        
-        # Create a new snapshot with minimal change (should not trigger evaluation)
         snapshot = self._create_test_snapshot(print_state="printing", progress=51)
-        
-        # Execute the evaluate method
+
         await self.companion._evaluate(snapshot)
-        
-        # Verify that no database calls were made (threshold not met)
+
         self.mock_jrpc.send_and_receive_method.assert_not_called()
-        
-        # Verify that FCM push was not called
         self.mock_fcm_client.push.assert_not_called()
+
+    # ------------------------------------------------------------------
+    # _fulfills_evaluation_threshold — one test per branch
+    # ------------------------------------------------------------------
+
+    def test_threshold_no_previous_snapshot(self):
+        """Always evaluate when there is no previous snapshot."""
+        self.companion._last_snapshot = None
+        snap = self._create_test_snapshot(print_state="printing", progress=50)
+        self.assertTrue(self.companion._fulfills_evaluation_threshold(snap))
+
+    def test_threshold_state_change(self):
+        """State change (e.g. printing → error) always crosses the threshold."""
+        self.companion._last_snapshot = self._create_test_snapshot(print_state="printing", progress=50)
+        snap = self._create_test_snapshot(print_state="error", progress=50)
+        self.assertTrue(self.companion._fulfills_evaluation_threshold(snap))
+
+    def test_threshold_state_unchanged_no_trigger(self):
+        """Same state and no other changes → threshold not crossed."""
+        prev = self._create_test_snapshot(print_state="printing", progress=50)
+        self.companion._last_snapshot = prev
+        snap = self._create_test_snapshot(print_state="printing", progress=50)
+        # Ensure filament sensors and hashes are identical
+        snap.m117_hash = prev.m117_hash
+        snap.gcode_response_hash = prev.gcode_response_hash
+        self.assertFalse(self.companion._fulfills_evaluation_threshold(snap))
+
+    def test_threshold_m117_changed(self):
+        """A new $MR$ M117 message crosses the threshold."""
+        prev = self._create_test_snapshot(print_state="printing", progress=50)
+        self.companion._last_snapshot = prev
+        snap = self._create_test_snapshot(
+            print_state="printing", progress=50, m117="$MR$:Alert|Something happened"
+        )
+        self.assertTrue(self.companion._fulfills_evaluation_threshold(snap))
+
+    def test_threshold_gcode_response_changed(self):
+        """A new MR_NOTIFY: gcode response crosses the threshold."""
+        prev = self._create_test_snapshot(print_state="printing", progress=50)
+        self.companion._last_snapshot = prev
+        snap = self._create_test_snapshot(
+            print_state="printing", progress=50, gcode_response="MR_NOTIFY:Something happened"
+        )
+        self.assertTrue(self.companion._fulfills_evaluation_threshold(snap))
+
+    def test_threshold_filament_sensor_runout(self):
+        """A filament sensor changing from detected to not-detected crosses the threshold."""
+        from mobileraker.data.dtos.moonraker.printer_objects import FilamentSensor
+        prev = self._create_test_snapshot(print_state="printing", progress=50)
+        prev.filament_sensors = {
+            "extruder": FilamentSensor(name="extruder", kind="filament_switch_sensor",
+                                       enabled=True, filament_detected=True)
+        }
+        self.companion._last_snapshot = prev
+
+        snap = self._create_test_snapshot(print_state="printing", progress=50)
+        snap.filament_sensors = {
+            "extruder": FilamentSensor(name="extruder", kind="filament_switch_sensor",
+                                       enabled=True, filament_detected=False)  # runout!
+        }
+        self.assertTrue(self.companion._fulfills_evaluation_threshold(snap))
+
+    # ------------------------------------------------------------------
+    # _run_evaluations — debounce and task management
+    # ------------------------------------------------------------------
+
+    async def test_persistent_error_still_notifies(self):
+        """A genuine persistent error (no recovery snapshot within debounce window) MUST
+        still produce a notification — the debounce must not swallow real errors."""
+        evaluated_snapshots = []
+
+        async def spy_evaluate(snapshot):
+            evaluated_snapshots.append(snapshot)
+
+        self.companion._evaluate = spy_evaluate
+        self.companion._error_debounce_seconds = 0
+
+        error_snapshot = self._create_error_snapshot(progress=30)
+        # No recovery snapshot is ever set — error persists
+
+        self.companion._create_eval_task(error_snapshot)
+
+        for _ in range(5):
+            await asyncio.sleep(0)
+
+        self.assertEqual(len(evaluated_snapshots), 1, "Persistent error should still be evaluated")
+        self.assertEqual(evaluated_snapshots[0].print_state, "error",
+                         "The error snapshot should reach _evaluate unchanged")
+
+    async def test_second_create_eval_task_does_not_spawn_second_loop(self):
+        """_evaluation_running is set synchronously before create_task returns, so a second
+        _create_eval_task call in the same tick cannot spawn a concurrent evaluation loop."""
+        loop_start_count = [0]
+        original_run = self.companion._run_evaluations
+
+        async def counting_run():
+            loop_start_count[0] += 1
+            await original_run()
+
+        self.companion._run_evaluations = counting_run
+        self.companion._error_debounce_seconds = 0
+
+        snap1 = self._create_test_snapshot(print_state="printing", progress=50)
+        snap2 = self._create_test_snapshot(print_state="printing", progress=75)
+
+        # Both calls happen before any task has a chance to execute
+        self.companion._create_eval_task(snap1)
+        self.companion._create_eval_task(snap2)
+
+        for _ in range(10):
+            await asyncio.sleep(0)
+
+        self.assertEqual(loop_start_count[0], 1,
+                         "Exactly one evaluation loop should start; _evaluation_running "
+                         "must prevent a second from being spawned")
+        self.assertFalse(self.companion._evaluation_running)
 
 
 def async_test(coro):

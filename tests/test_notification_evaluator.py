@@ -392,48 +392,119 @@ class TestNotificationEvaluator(unittest.TestCase):
         self.assertIsNone(result)
 
     def test_evaluate_all_notifications_for_device_comprehensive(self):
-        """Test the comprehensive notification evaluation method."""
-        # Create snapshot with multiple notification triggers
-        m117_snapshot = self._create_test_snapshot(
-            print_state="printing", 
-            progress=75, 
+        """All distinct notification types fire when their conditions are simultaneously met."""
+        snapshot = self._create_test_snapshot(
+            print_state="printing",
+            progress=75,
             m117="$MR$:Print Progress|75% Complete"
         )
-        
-        # Set previous state to trigger state notification
-        self.device_cfg.snap.state = "paused"
-        self.device_cfg.snap.progress = 50  # To trigger progress notification
-        
-        # Create some filament sensors
-        sensor1 = FilamentSensor(name="extruder", kind="switch", enabled=True, filament_detected=False)
-        m117_snapshot.filament_sensors = {"sensor1": sensor1}
-        
-        # Set up last snapshot for live activity
+        sensor_runout = FilamentSensor(name="extruder", kind="switch", enabled=True, filament_detected=False)
+        snapshot.filament_sensors = {"extruder": sensor_runout}
+
+        self.device_cfg.snap.state = "paused"      # triggers statusUpdates
+        self.device_cfg.snap.progress = 50          # triggers progressUpdates (25% interval)
+        self.device_cfg.snap.progress_progressbar = 50
+        self.device_cfg.snap.progress_live_activity = 50
+
         last_snapshot = self._create_test_snapshot(print_state="paused", progress=50)
-        
-        # Evaluate all notifications
+
         result = self.evaluator.evaluate_all_notifications_for_device(
-            self.device_cfg, m117_snapshot, last_snapshot, exclude_sensors=[]
+            self.device_cfg, snapshot, last_snapshot, exclude_sensors=[]
         )
-        
-        # Should have multiple notifications
-        self.assertGreater(len(result.notifications), 1)
-        
-        # Check that we have the expected notification types
-        channels = [getattr(n, 'channel', None) for n in result.notifications]
-        notification_types = set(channel.split('-')[-1] if channel else None for channel in channels)
-        
-        # Should include state, progress, M117, filament sensor, and live activity notifications
-        expected_types = {'statusUpdates', 'progressUpdates', 'm117', 'filamentSensor'}
-        actual_types = {t for t in notification_types if t}
-        
-        # Check that we got at least some of the expected notification types
-        self.assertTrue(expected_types.intersection(actual_types), 
-                       f"Expected some of {expected_types}, got {actual_types}")
-        
-        # Check side effect flags
-        self.assertTrue(result.has_live_activity, "Should have live activity update")
-        self.assertTrue(result.has_progress_notification, "Should have progress notification")
+
+        channels = {
+            n.channel.split('-')[-1]
+            for n in result.notifications
+            if hasattr(n, 'channel') and n.channel
+        }
+
+        self.assertIn('statusUpdates', channels, "State change must produce a statusUpdates notification")
+        self.assertIn('progressUpdates', channels, "25% progress jump must produce a progressUpdates notification")
+        self.assertIn('m117', channels, "New $MR$ M117 message must produce an m117 notification")
+        self.assertIn('filamentSensor', channels, "Runout sensor must produce a filamentSensor notification")
+        self.assertTrue(result.has_live_activity, "Live activity flag must be set")
+        self.assertTrue(result.has_progress_notification, "Progress notification flag must be set")
+
+    # ------------------------------------------------------------------
+    # State notification — missing transition directions
+    # ------------------------------------------------------------------
+
+    @patch('mobileraker.service.notification_evaluator.translate_replace_placeholders')
+    def test_evaluate_state_notification_standby_to_printing(self, mock_translate):
+        """standby → printing generates a 'started printing' notification."""
+        mock_translate.side_effect = lambda key, *args, **kwargs: f"translated_{key}"
+        self.device_cfg.snap.state = "standby"
+
+        result = self.evaluator.evaluate_state_notification(self.device_cfg, self.printing_snapshot)
+
+        self.assertIsInstance(result, NotificationContentDto)
+        self.assertEqual(result.body, "translated_state_printing_body")
+
+    @patch('mobileraker.service.notification_evaluator.translate_replace_placeholders')
+    def test_evaluate_state_notification_printing_to_error(self, mock_translate):
+        """printing → error generates an 'error while printing' notification.
+
+        This is one side of the oscillation that caused the bug report's notification storm.
+        """
+        mock_translate.side_effect = lambda key, *args, **kwargs: f"translated_{key}"
+        self.device_cfg.snap.state = "printing"
+
+        result = self.evaluator.evaluate_state_notification(self.device_cfg, self.error_snapshot)
+
+        self.assertIsInstance(result, NotificationContentDto)
+        self.assertEqual(result.body, "translated_state_error_body")
+
+    @patch('mobileraker.service.notification_evaluator.translate_replace_placeholders')
+    def test_evaluate_state_notification_error_to_printing(self, mock_translate):
+        """error → printing generates a 'started printing' notification.
+
+        This is the other side of the oscillation. After the fix this transition should
+        only fire when the state genuinely changes (not from a transient reconnect blip).
+        """
+        mock_translate.side_effect = lambda key, *args, **kwargs: f"translated_{key}"
+        self.device_cfg.snap.state = "error"
+
+        result = self.evaluator.evaluate_state_notification(self.device_cfg, self.printing_snapshot)
+
+        self.assertIsInstance(result, NotificationContentDto)
+        self.assertEqual(result.body, "translated_state_printing_body")
+
+    # ------------------------------------------------------------------
+    # Progress notification — threshold not reached
+    # ------------------------------------------------------------------
+
+    @patch('mobileraker.service.notification_evaluator.normalized_progress_interval_reached')
+    def test_evaluate_progress_notification_threshold_not_reached(self, mock_interval_reached):
+        """No progress notification when the interval threshold has not been crossed."""
+        mock_interval_reached.return_value = False
+        self.device_cfg.snap.state = "printing"
+        self.device_cfg.snap.progress = 49  # just below 50
+
+        result = self.evaluator.evaluate_progress_notification(self.device_cfg, self.printing_snapshot)
+
+        self.assertIsNone(result)
+        mock_interval_reached.assert_called_once()
+
+    # ------------------------------------------------------------------
+    # Progressbar notification — progress unchanged
+    # ------------------------------------------------------------------
+
+    @patch('mobileraker.service.notification_evaluator.normalized_progress_interval_reached')
+    def test_evaluate_progressbar_notification_progress_unchanged(self, mock_interval_reached):
+        """No progressbar notification when neither the progress interval nor the time interval is reached."""
+        mock_interval_reached.return_value = False
+        self.device_cfg.snap.state = "printing"
+        self.device_cfg.snap.progress_progressbar = 49
+        # Prevent the secondary time-interval condition from triggering
+        self.device_cfg.snap.last_progress_progressbar = datetime.now()
+
+        result = self.evaluator.evaluate_progressbar_notification(self.device_cfg, self.printing_snapshot)
+
+        self.assertIsNone(result)
+
+    # ------------------------------------------------------------------
+    # evaluate_all_notifications_for_device — precise assertions
+    # ------------------------------------------------------------------
 
     def test_evaluate_all_notifications_for_device_no_notifications(self):
         """Test when minimal notifications should be generated."""
