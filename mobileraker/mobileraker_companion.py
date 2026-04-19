@@ -1,4 +1,4 @@
-from asyncio import AbstractEventLoop, Lock
+from asyncio import AbstractEventLoop
 import asyncio
 import base64
 import logging
@@ -61,7 +61,9 @@ class MobilerakerCompanion:
             f'mobileraker.{printer_name.replace(".","_")}')
         self._last_snapshot: Optional[PrinterSnapshot] = None
         self._last_apns_message: Optional[int] = None
-        self._evaulate_noti_lock: Lock = Lock()
+        self._pending_snapshot: Optional[PrinterSnapshot] = None
+        self._evaluation_running: bool = False
+        self._error_debounce_seconds: float = 5.0
         self._notification_evaluator = NotificationEvaluator(companion_config, self.remote_config)
 
         self._logger.info('MobilerakerCompanion client created for %s, it will ignore the following sensors: %s',
@@ -76,28 +78,44 @@ class MobilerakerCompanion:
         await self._jrpc.connect()
 
     def _create_eval_task(self, snapshot: PrinterSnapshot) -> None:
-        self.loop.create_task(self._evaluate_with_timeout(snapshot))
+        self._pending_snapshot = snapshot
+        if not self._evaluation_running:
+            # Set True here (synchronously, before create_task) so that any subsequent
+            # _create_eval_task calls in the same or next event loop tick see it as True
+            # and don't spawn a second evaluation loop.
+            self._evaluation_running = True
+            self.loop.create_task(self._run_evaluations())
 
-    async def _evaluate_with_timeout(self, snapshot: PrinterSnapshot) -> None:
+    async def _run_evaluations(self) -> None:
         """
-        This method starts the evaluation process with a timeout.
-        It tries to acquire a lock before starting the evaluation.
-        If the lock cannot be acquired within 60 seconds, or if the evaluation takes longer than 60 seconds,
-        it logs a warning and releases the lock.
+        Process pending snapshots one at a time using a latest-wins approach.
+
+        Only the most recent snapshot is evaluated when a new one arrives while an evaluation is
+        in progress. Error state snapshots are debounced by a short delay to suppress spurious
+        notifications caused by transient WebSocket reconnects or brief Klippy restarts.
         """
-        lock_acquired = False
         try:
-            lock_acquired = await asyncio.wait_for(self._evaulate_noti_lock.acquire(), timeout=60)
-            if lock_acquired:
-                await asyncio.wait_for(self._evaluate(snapshot), timeout=60)
-        except asyncio.TimeoutError:
-            if lock_acquired:
-                self._logger.warning('Evaluation task execution timed out after 60 seconds!')
-            else:
-                self._logger.warning('Evaluation task was unable to acquire lock after 60 seconds!')
+            while self._pending_snapshot is not None:
+                snapshot = self._pending_snapshot
+                self._pending_snapshot = None
+
+                # Debounce error states: brief Klippy unavailability during reconnects causes
+                # print_state="error" even when the print is running fine. Wait a few seconds to
+                # see if a recovery snapshot arrives before evaluating.
+                if snapshot.print_state == 'error':
+                    await asyncio.sleep(self._error_debounce_seconds)
+                    if self._pending_snapshot is not None:
+                        snapshot = self._pending_snapshot
+                        self._pending_snapshot = None
+
+                try:
+                    await asyncio.wait_for(self._evaluate(snapshot), timeout=60)
+                except asyncio.TimeoutError:
+                    self._logger.warning('Evaluation task execution timed out after 60 seconds!')
+                except Exception:
+                    self._logger.exception('Evaluation task raised an unhandled exception')
         finally:
-            if lock_acquired:
-                self._evaulate_noti_lock.release()
+            self._evaluation_running = False
 
 
     async def _evaluate(self, snapshot: PrinterSnapshot) -> None:
